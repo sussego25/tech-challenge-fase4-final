@@ -1,0 +1,291 @@
+name: Deploy to Production
+
+# Quando rodar: push para main
+on:
+  push:
+    branches:
+      - main
+
+# Variáveis globais
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ENVIRONMENT: prod  # Ambiente de produção
+
+jobs:
+  # Job 1: Deploy da Infraestrutura (Terraform)
+  deploy-infra:
+    runs-on: ubuntu-latest  # Máquina virtual Ubuntu
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4  # Baixa o código do repositório
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"  # Versão do Terraform
+          terraform_wrapper: false
+
+      - name: Build Lambda package
+        # Executa build_package.py diretamente para garantir wheels corretos:
+        # - pydantic_core instalado com --platform manylinux2014_x86_64 --python-version 311
+        # - Compatível com Lambda Python 3.11 Linux x86_64
+        run: cd tech-challenger/infra/lambda && python3 build_package.py
+
+      - name: Terraform Init (Infra Root)
+        working-directory: tech-challenger/infra/terraform
+        run: terraform init
+
+      # ----------------------------------------------------------------
+      # Limpeza de state para recursos deletados manualmente no console.
+      # Deve rodar APÓS terraform init (precisa do backend configurado).
+      # Protege contra o caso em que o EKS foi deletado fora do Terraform:
+      #   1. Remove cluster e node group do state (não existem mais na AWS)
+      #   2. Deleta o OIDC provider IAM órfão da AWS (URL do cluster antigo)
+      #      e remove do state — a AWS não permite alterar a URL, só recriar
+      # O worker IRSA role permanece no state (ainda existe na AWS);
+      # o Terraform atualiza seu trust policy via module.eks[0].oidc_provider_arn.
+      # ----------------------------------------------------------------
+      - name: Limpar state do EKS se deletado manualmente
+        working-directory: tech-challenger/infra/terraform
+        run: |
+          CLUSTER_NAME="tech-challenger-${{ env.ENVIRONMENT }}"
+
+          EXISTS=$(aws eks describe-cluster --name "$CLUSTER_NAME" \
+            --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$EXISTS" = "NOT_FOUND" ]; then
+            echo "⚠️  Cluster '$CLUSTER_NAME' não encontrado na AWS. Limpando state..."
+
+            terraform state rm 'module.eks[0].aws_eks_cluster.main'    2>/dev/null || true
+            terraform state rm 'module.eks[0].aws_eks_node_group.main' 2>/dev/null || true
+
+            OIDC_ARN=$(terraform state show 'module.eks[0].aws_iam_openid_connect_provider.eks' \
+              2>/dev/null | grep '^\s*arn\s' | awk '{print $3}' | tr -d '"' || echo "")
+
+            if [ -n "$OIDC_ARN" ]; then
+              echo "Deletando OIDC provider órfão: $OIDC_ARN"
+              aws iam delete-open-id-connect-provider \
+                --open-id-connect-provider-arn "$OIDC_ARN" 2>/dev/null || true
+            fi
+
+            terraform state rm 'module.eks[0].aws_iam_openid_connect_provider.eks' 2>/dev/null || true
+            echo "✅ State limpo. Terraform recriará EKS do zero."
+          else
+            echo "✅ Cluster '$CLUSTER_NAME' encontrado ($EXISTS). Sem limpeza necessária."
+          fi
+
+      - name: Bootstrap ECR e S3 para artefatos YOLO
+        working-directory: tech-challenger/infra/terraform
+        run: |
+          terraform apply -auto-approve \
+            -target=module.ecr \
+            -target=module.s3 \
+            -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Login no Amazon ECR
+        id: login-ecr-infra
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Login no AWS Deep Learning Containers ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-east-1.amazonaws.com
+
+      - name: Build e Push YOLO inference para ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr-infra.outputs.registry }}
+        run: |
+          docker build \
+            -f yolo-model/Dockerfile \
+            -t $ECR_REGISTRY/yolo-inference:latest \
+            yolo-model/
+          docker push $ECR_REGISTRY/yolo-inference:latest
+
+      # - name: Package e Upload YOLO model artifact
+      #   working-directory: yolo-model
+      #   run: |
+      #     python package_model.py
+      #     BUCKET_NAME=$(cd ../tech-challenger/infra/terraform && terraform output -raw diagrams_bucket_name)
+      #     aws s3 cp model.tar.gz "s3://${BUCKET_NAME}/models/yolo/model.tar.gz"
+
+      - name: Terraform Plan (Infra Root)
+        working-directory: tech-challenger/infra/terraform
+        run: terraform plan -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Terraform Apply (Infra Root)
+        working-directory: tech-challenger/infra/terraform
+        run: terraform apply -auto-approve -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Export Terraform Outputs
+        id: tf-outputs
+        working-directory: tech-challenger/infra/terraform
+        run: |
+          echo "eks_cluster_name=$(terraform output -raw eks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "worker_role_arn=$(terraform output -raw worker_service_role_arn)" >> $GITHUB_OUTPUT
+          echo "sqs_queue_url=$(terraform output -raw architecture_analysis_queue_url)" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(terraform output -raw diagrams_bucket_name)" >> $GITHUB_OUTPUT
+          echo "dynamodb_table=$(terraform output -raw diagrams_table_name)" >> $GITHUB_OUTPUT
+          echo "yolo_sagemaker_endpoint=$(terraform output -raw yolo_sagemaker_endpoint_name)" >> $GITHUB_OUTPUT
+
+    outputs:
+      eks_cluster_name: ${{ steps.tf-outputs.outputs.eks_cluster_name }}
+      worker_role_arn: ${{ steps.tf-outputs.outputs.worker_role_arn }}
+      sqs_queue_url: ${{ steps.tf-outputs.outputs.sqs_queue_url }}
+      s3_bucket: ${{ steps.tf-outputs.outputs.s3_bucket }}
+      dynamodb_table: ${{ steps.tf-outputs.outputs.dynamodb_table }}
+      yolo_sagemaker_endpoint: ${{ steps.tf-outputs.outputs.yolo_sagemaker_endpoint }}
+
+  upload-yolo-model:
+    runs-on: ubuntu-latest
+    needs: deploy-infra
+    steps:
+      - name: Checkout Tech-Challenge-fase-4 repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # - name: Package YOLO model
+      #   run: |
+      #     cd yolo-model
+      #     python package_model.py
+
+      # - name: Configure AWS credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ secrets.AWS_REGION }}
+
+      # - name: Upload YOLO model artifact to S3
+      #   run: |
+      #     aws s3 cp yolo-model/model.tar.gz "s3://${{ needs.deploy-infra.outputs.s3_bucket }}/models/yolo/model.tar.gz"
+
+  # Job 2: Deploy dos Serviços (Docker → ECR → Helm no EKS)
+  deploy-services:
+    runs-on: ubuntu-latest
+    needs: deploy-infra
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e Push worker-service para ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f tech-challenger/services/worker-service/Dockerfile \
+            -t $ECR_REGISTRY/worker-service:$IMAGE_TAG \
+            -t $ECR_REGISTRY/worker-service:latest \
+            tech-challenger/
+          docker push $ECR_REGISTRY/worker-service:$IMAGE_TAG
+          docker push $ECR_REGISTRY/worker-service:latest
+
+      - name: Conceder acesso ao EKS via access entry
+        run: |
+          # Obtém o ARN do caller atual (usuário/role do GitHub Actions)
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          CLUSTER_NAME=${{ needs.deploy-infra.outputs.eks_cluster_name }}
+
+          # Se for um assumed-role, converte para o ARN da role base
+          if echo "$CALLER_ARN" | grep -q "assumed-role"; then
+            ROLE_NAME=$(echo "$CALLER_ARN" | sed -E 's|.*/assumed-role/([^/]+)/.*|\1|')
+            PRINCIPAL_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+          else
+            PRINCIPAL_ARN="$CALLER_ARN"
+          fi
+
+          echo "Granting EKS access to: $PRINCIPAL_ARN"
+
+          # Cria access entry (ignora erro se já existir)
+          aws eks create-access-entry \
+            --cluster-name "$CLUSTER_NAME" \
+            --principal-arn "$PRINCIPAL_ARN" \
+            --type STANDARD 2>/dev/null || true
+
+          # Associa política de cluster admin
+          aws eks associate-access-policy \
+            --cluster-name "$CLUSTER_NAME" \
+            --principal-arn "$PRINCIPAL_ARN" \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster 2>/dev/null || true
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configurar kubeconfig para EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.deploy-infra.outputs.eks_cluster_name }}
+
+      - name: Instalar Helm
+        uses: azure/setup-helm@v3
+
+      - name: Aguardar nodes EKS ficarem Ready
+        # Nodes EC2 levam ~3-5min após o cluster ACTIVE para ficarem prontos.
+        # Sem essa espera, os pods ficam Pending e o Helm --wait timeout.
+        run: |
+          echo "Aguardando nodes ficarem Ready (máx 8min)..."
+          kubectl wait nodes \
+            --all \
+            --for=condition=Ready \
+            --timeout=480s
+          echo "✅ Nodes prontos:"
+          kubectl get nodes
+
+      - name: Deploy worker-service via Helm
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          SQS_QUEUE_URL: ${{ needs.deploy-infra.outputs.sqs_queue_url }}
+          S3_BUCKET: ${{ needs.deploy-infra.outputs.s3_bucket }}
+          DYNAMODB_TABLE: ${{ needs.deploy-infra.outputs.dynamodb_table }}
+          YOLO_SAGEMAKER_ENDPOINT: ${{ needs.deploy-infra.outputs.yolo_sagemaker_endpoint }}
+          WORKER_ROLE_ARN: ${{ needs.deploy-infra.outputs.worker_role_arn }}
+        run: |
+          # Escreve override em arquivo para evitar problemas com caracteres especiais
+          # no --set (barra no SQS_QUEUE_URL quebra o parsing do Helm)
+          cat > /tmp/worker-values-override.yaml << EOF
+          env:
+            AWS_REGION: "${AWS_REGION}"
+            SQS_QUEUE_URL: "${SQS_QUEUE_URL}"
+            S3_BUCKET: "${S3_BUCKET}"
+            DYNAMODB_TABLE: "${DYNAMODB_TABLE}"
+            YOLO_SAGEMAKER_ENDPOINT: "${YOLO_SAGEMAKER_ENDPOINT}"
+            LLM_PROVIDER: "bedrock"
+            BEDROCK_MODEL_ID: "amazon.nova-lite-v1:0"
+          EOF
+
+          helm upgrade --install worker-service \
+            tech-challenger/infra/eks/helm-charts/worker-service \
+            --namespace ${{ env.ENVIRONMENT }} \
+            --create-namespace \
+            -f /tmp/worker-values-override.yaml \
+            --set image.repository=$ECR_REGISTRY/worker-service \
+            --set image.tag=$IMAGE_TAG \
+            --set "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${WORKER_ROLE_ARN}" \
+            --wait --timeout 5m
+
