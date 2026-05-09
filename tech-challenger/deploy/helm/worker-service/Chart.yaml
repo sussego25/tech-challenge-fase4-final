@@ -1,0 +1,6 @@
+apiVersion: v2
+name: worker-service
+description: Helm chart para o worker-service no EKS (consome SQS, processa diagramas via SageMaker e grava relatório no DynamoDB)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

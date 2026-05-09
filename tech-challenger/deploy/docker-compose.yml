@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,sns
+      DEBUG: 1
+      DATA_DIR: /tmp/localstack/data
+    volumes:
+      - "${TMPDIR:-/tmp/localstack}:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+  order-service:
+    build:
+      context: ../services/order-service
+    ports:
+      - "8080:8080"
+    environment:
+      SQS_ENDPOINT: http://localstack:4566
+    depends_on:
+      - localstack
+
+  payment-service:
+    build:
+      context: ../services/payment-service
+    ports:
+      - "8081:8080"
+    environment:
+      SQS_ENDPOINT: http://localstack:4566
+    depends_on:
+      - localstack
+
+  worker-service:
+    build:
+      context: ..
+      dockerfile: services/worker-service/Dockerfile
+    environment:
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/tech-challenger-analysis-dev
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:tech-challenger-analysis-results-dev
+      S3_BUCKET: tech-challenger-diagrams-dev-000000000000
+      DYNAMODB_TABLE: tech-challenger-diagrams-dev
+      YOLO_SAGEMAKER_ENDPOINT: ""
+      LLM_PROVIDER: "bedrock"
+      SAGEMAKER_ENDPOINT: ""
+      BEDROCK_MODEL_ID: "amazon.nova-lite-v1:0"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      - localstack

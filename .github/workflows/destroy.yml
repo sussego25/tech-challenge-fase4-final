@@ -1,0 +1,274 @@
+name: Destroy Infrastructure (DESTRUIR TUDO)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: 'Set to true to allow this workflow to destroy infrastructure'
+        required: true
+        type: boolean
+        default: false
+      confirmation:
+        description: 'Digite DESTRUIR para confirmar a destruição de toda a infraestrutura AWS'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ENVIRONMENT: prod
+
+jobs:
+  # Guarda de segurança — cancela se confirmação errada
+  validar-confirmacao:
+    runs-on: ubuntu-latest
+    outputs:
+      should_destroy: ${{ steps.set.outputs.should_destroy }}
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Verificar confirmação
+        id: set
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DESTROY="${{ github.event.inputs.destroy }}"
+            CONFIRMATION="${{ github.event.inputs.confirmation }}"
+          else
+            DESTROY="false"
+            CONFIRMATION=""
+            if [ -f destroy.yml ]; then
+              DESTROY=$(grep -E '^destroy:' destroy.yml | awk '{print $2}' | tr -d '"')
+              CONFIRMATION=$(grep -E '^confirmation:' destroy.yml | awk '{print $2}' | tr -d '"')
+            fi
+          fi
+
+          if [ "$DESTROY" != "true" ]; then
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+            echo "❌ Destroy flag false ou ausente. Nenhuma ação será executada."
+            exit 0
+          fi
+
+          if [ "$CONFIRMATION" != "DESTRUIR" ]; then
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+            echo "❌ Confirmação incorreta. Digite exatamente: DESTRUIR"
+            exit 1
+          fi
+
+          echo "should_destroy=true" >> $GITHUB_OUTPUT
+          echo "✅ Confirmação válida. Iniciando destruição..."
+
+  # Job 1 — Remove serviços do EKS antes de destruir a infra
+  remover-servicos-eks:
+    runs-on: ubuntu-latest
+    needs: validar-confirmacao
+    if: needs.validar-confirmacao.outputs.should_destroy == 'true'
+    steps:
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Instalar kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Instalar Helm
+        uses: azure/setup-helm@v3
+
+      - name: Obter nome do cluster EKS
+        id: eks
+        run: |
+          CLUSTER=$(aws eks list-clusters \
+            --query 'clusters[?contains(@, `tech-challenger`)]' \
+            --output text 2>/dev/null | head -n1 || echo "")
+          echo "cluster_name=$CLUSTER" >> $GITHUB_OUTPUT
+          echo "Cluster encontrado: $CLUSTER"
+
+      - name: Configurar kubeconfig
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ steps.eks.outputs.cluster_name }}
+
+      - name: Remover releases Helm
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          helm uninstall worker-service --namespace ${{ env.ENVIRONMENT }} --ignore-not-found 2>/dev/null || true
+
+      - name: Deletar todos os Services do tipo LoadBalancer
+        # CRÍTICO: Services LoadBalancer criam ELBs fora do Terraform state.
+        # Se não forem removidos, a AWS bloqueia a deleção da VPC/subnets.
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          echo "Removendo todos os LoadBalancer services em todos os namespaces..."
+          kubectl get svc --all-namespaces -o json | \
+            jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' | \
+            while read NS NAME; do
+              echo "  Deletando LoadBalancer: $NS/$NAME"
+              kubectl delete svc "$NAME" -n "$NS" --ignore-not-found || true
+            done
+          echo "Aguardando ELBs serem removidos pela AWS (60s)..."
+          sleep 60
+
+      - name: Deletar todos os PVCs (evita volumes EBS órfãos)
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          kubectl delete pvc --all --all-namespaces --ignore-not-found || true
+
+      - name: Deletar todos os namespaces da aplicação
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          kubectl delete namespace ${{ env.ENVIRONMENT }} --ignore-not-found --timeout=120s || true
+
+      - name: Escalar node group para zero (acelera deleção)
+        if: steps.eks.outputs.cluster_name != ''
+        run: |
+          CLUSTER="${{ steps.eks.outputs.cluster_name }}"
+          NODE_GROUPS=$(aws eks list-nodegroups --cluster-name "$CLUSTER" \
+            --query 'nodegroups[]' --output text 2>/dev/null || echo "")
+          for NG in $NODE_GROUPS; do
+            echo "Escalando node group $NG para 0..."
+            aws eks update-nodegroup-config \
+              --cluster-name "$CLUSTER" \
+              --nodegroup-name "$NG" \
+              --scaling-config desiredSize=0,minSize=0,maxSize=1 2>/dev/null || true
+          done
+          echo "Aguardando nodes terminarem (90s)..."
+          sleep 90
+
+  # Job 2 — Esvazia buckets S3 (terraform destroy falha em buckets não-vazios)
+  esvaziar-s3:
+    runs-on: ubuntu-latest
+    needs: validar-confirmacao
+    if: needs.validar-confirmacao.outputs.should_destroy == 'true'
+    steps:
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Esvaziar buckets S3 do projeto
+        run: |
+          # O bucket de tfstate NÃO deve ser apagado — Terraform precisa dele para redeployar
+          TFSTATE_BUCKET="tech-challenger-tfstate-325066546876"
+
+          # Lista todos os buckets do projeto e os esvazia (exceto tfstate)
+          BUCKETS=$(aws s3api list-buckets \
+            --query 'Buckets[?contains(Name, `tech-challenger`)].Name' \
+            --output text 2>/dev/null || echo "")
+
+          BUCKETS=$(echo "$BUCKETS" | tr ' ' '\n' | grep -v "^${TFSTATE_BUCKET}$" | tr '\n' ' ')
+
+          for BUCKET in $BUCKETS; do
+            echo "Esvaziando bucket: $BUCKET"
+            # Remove todas as versões e delete markers (versioning habilitado)
+            aws s3api list-object-versions --bucket "$BUCKET" \
+              --query 'Versions[].{Key:Key,VersionId:VersionId}' \
+              --output json 2>/dev/null | \
+              jq -r '.[] | "--key \"\(.Key)\" --version-id \(.VersionId)"' | \
+              while read ARGS; do
+                eval "aws s3api delete-object --bucket $BUCKET $ARGS" 2>/dev/null || true
+              done
+
+            # Remove delete markers
+            aws s3api list-object-versions --bucket "$BUCKET" \
+              --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' \
+              --output json 2>/dev/null | \
+              jq -r '.[] | "--key \"\(.Key)\" --version-id \(.VersionId)"' | \
+              while read ARGS; do
+                eval "aws s3api delete-object --bucket $BUCKET $ARGS" 2>/dev/null || true
+              done
+
+            # Esvazia o bucket normalmente
+            aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+            echo "✅ Bucket $BUCKET esvaziado."
+          done
+
+  # Job 3 — Terraform destroy (destrói toda a infra)
+  terraform-destroy:
+    runs-on: ubuntu-latest
+    needs:
+      - remover-servicos-eks
+      - esvaziar-s3
+    if: needs.validar-confirmacao.outputs.should_destroy == 'true'
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Criar diretório build vazio (evita erro do archive_file)
+        run: mkdir -p tech-challenger/infra/lambda/terraform/build
+
+      - name: Terraform Init
+        working-directory: tech-challenger/infra/terraform
+        run: terraform init
+
+      - name: Terraform Destroy
+        working-directory: tech-challenger/infra/terraform
+        run: |
+          terraform destroy \
+            -auto-approve \
+            -var="environment=${{ env.ENVIRONMENT }}"
+
+      - name: Fallback — forçar deleção do EKS se Terraform falhou
+        if: failure()
+        run: |
+          echo "Terraform falhou. Tentando forçar deleção do EKS via AWS CLI..."
+          CLUSTER=$(aws eks list-clusters \
+            --query 'clusters[?contains(@, `tech-challenger`)]' \
+            --output text 2>/dev/null | head -n1 || echo "")
+
+          if [ -n "$CLUSTER" ]; then
+            # Remove node groups primeiro
+            NODE_GROUPS=$(aws eks list-nodegroups --cluster-name "$CLUSTER" \
+              --query 'nodegroups[]' --output text 2>/dev/null || echo "")
+            for NG in $NODE_GROUPS; do
+              echo "Deletando node group $NG..."
+              aws eks delete-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$NG" || true
+              aws eks wait nodegroup-deleted --cluster-name "$CLUSTER" --nodegroup-name "$NG" || true
+            done
+
+            # Deleta o cluster
+            echo "Deletando cluster EKS $CLUSTER..."
+            aws eks delete-cluster --name "$CLUSTER" || true
+            aws eks wait cluster-deleted --name "$CLUSTER" || true
+            echo "✅ Cluster EKS deletado."
+          fi
+
+          # Limpa Security Groups órfãos da VPC do projeto
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Project,Values=tech-challenger" \
+            --query 'Vpcs[].VpcId' --output text 2>/dev/null || echo "")
+          for VPC in $VPC_IDS; do
+            SGs=$(aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC" \
+              --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+              --output text 2>/dev/null || echo "")
+            for SG in $SGs; do
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+          done
+
+          echo "Tente rodar o terraform destroy manualmente ou re-triggere este workflow."
+          exit 1
+
+      - name: Confirmação final
+        run: echo "✅ Toda a infraestrutura foi destruída com sucesso. Cobranças AWS serão zeradas em breve."

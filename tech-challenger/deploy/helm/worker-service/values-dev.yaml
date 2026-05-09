@@ -1,0 +1,52 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: "<ECR_REGISTRY>/worker-service"
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: "worker-service"
+  annotations:
+    eks.amazonaws.com/role-arn: "<WORKER_SERVICE_IRSA_ROLE_ARN>"
+
+env:
+  AWS_REGION: us-east-1
+  SQS_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/325066546876/tech-challenger-architecture-analysis-queue-prod"
+  SNS_TOPIC_ARN: "arn:aws:sns:us-east-1:325066546876:tech-challenger-analysis-results-prod"
+  DYNAMODB_TABLE: "tech-challenger-diagrams-prod"
+  YOLO_SAGEMAKER_ENDPOINT: "tech-challenger-yolo-prod"
+  LLM_PROVIDER: "bedrock"
+  SAGEMAKER_ENDPOINT: ""
+  BEDROCK_MODEL_ID: "amazon.nova-lite-v1:0"
+
+existingSecretName: ""
+secretEnv: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+livenessProbe:
+  enabled: false
+
+readinessProbe:
+  enabled: false

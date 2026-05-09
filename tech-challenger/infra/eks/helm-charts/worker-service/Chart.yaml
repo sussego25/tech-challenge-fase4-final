@@ -1,0 +1,6 @@
+apiVersion: v2
+name: worker-service
+description: Helm chart for worker-service on EKS
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

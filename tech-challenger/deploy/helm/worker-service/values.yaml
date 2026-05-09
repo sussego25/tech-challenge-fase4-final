@@ -1,0 +1,58 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: 325066546876.dkr.ecr.us-east-1.amazonaws.com/worker-service
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: "worker-service"
+  annotations:
+    # IRSA: role criada pelo modulo infra/eks/terraform/iam
+    eks.amazonaws.com/role-arn: "arn:aws:iam::325066546876:role/tech-challenger-worker-service-role-prod"
+
+env:
+  AWS_REGION: us-east-1
+  SQS_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/325066546876/tech-challenger-architecture-analysis-queue-prod"
+  SNS_TOPIC_ARN: "arn:aws:sns:us-east-1:325066546876:tech-challenger-analysis-results-prod"
+  DYNAMODB_TABLE: "tech-challenger-diagrams-prod"
+  YOLO_SAGEMAKER_ENDPOINT: "tech-challenger-yolo-prod"
+  LLM_PROVIDER: "bedrock"
+  SAGEMAKER_ENDPOINT: ""
+  BEDROCK_MODEL_ID: "amazon.nova-lite-v1:0"
+
+# Nome de um Secret existente com variaveis sensiveis (opcional)
+existingSecretName: ""
+secretEnv: []
+# Exemplo:
+# secretEnv:
+#   - name: AWS_SECRET_ACCESS_KEY
+#     key: aws_secret_access_key
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+livenessProbe:
+  enabled: false
+
+readinessProbe:
+  enabled: false
